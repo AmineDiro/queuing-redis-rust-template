@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Test Technique winamax</title>
+  </head>
+  <body>
+    <label for="numberInput">Enter a number:</label>
+    <input type="number" id="numberInput" step="1" />
+    <button onclick="sendMessage()">Send</button>
+
+    <div id="output"></div>
+
+    <script>
+      const socket = new WebSocket("ws://localhost:3000/ws");
+
+      var msg_id = 0;
+      socket.onopen = function (event) {
+        console.log("WebSocket connection established.");
+      };
+
+      socket.onmessage = function (event) {
+        const outputDiv = document.getElementById("output");
+        outputDiv.innerHTML = "Received from server: " + event.data;
+      };
+
+      function sendMessage() {
+        const numberInput = parseInt(
+          document.getElementById("numberInput").value
+        );
+        const obj = { command: "enqueue", count: numberInput, mid: msg_id };
+        const blob = new Blob([JSON.stringify(obj, null, 2)], {
+          type: "application/json",
+        });
+        console.log("Sending blob over websocket: {}", obj);
+        socket.send(blob);
+        msg_id += 1;
+      }
+    </script>
+  </body>
+</html>
