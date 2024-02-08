@@ -67,7 +67,7 @@ async fn handle_socket(
                     tracing::info!("Enqueueing {} msg for {}.", msg.count, &peer_addr);
                     for idx in 0..msg.count {
                         let worker_msg = format!("{}:{}:{}", client_id, msg.mid, idx);
-                        let _ = redis::cmd("LPUSH")
+                        let _: usize = redis::cmd("LPUSH")
                             .arg("queue")
                             .arg(worker_msg)
                             .query_async(&mut conn)
