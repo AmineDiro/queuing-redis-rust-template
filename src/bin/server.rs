@@ -3,6 +3,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
+    http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -22,7 +23,7 @@ use tower_http::{
 };
 
 use axum::extract::connect_info::ConnectInfo;
-use futures::stream::StreamExt;
+use futures::{stream::StreamExt, SinkExt};
 
 async fn ws_handler(
     ws: WebSocketUpgrade,
@@ -47,41 +48,68 @@ async fn handle_socket(
     mut conn: ConnectionManager,
     rx: Receiver<WorkerMessage>,
 ) {
-    let (mut _sender, mut receiver) = socket.split();
+    let (mut sender, mut receiver) = socket.split();
 
-    while let Some(Ok(msg)) = receiver.next().await {
-        // Process ws message
-        match process_ws_message(msg, peer_addr) {
-            ControlFlow::Continue(Some(msg)) => {
-                // Enqueue to redis
-                tracing::info!("Enqueueing {} msg for {}.", msg.count, &peer_addr);
-                for idx in 0..msg.count {
-                    let worker_msg = format!("{}:{}:{}", client_id, msg.mid, idx);
-                    match redis::cmd("LPUSH")
-                        .arg("queue")
-                        .arg(worker_msg)
-                        .query_async::<_, usize>(&mut conn)
-                        .await
-                    {
-                        Ok(_) => continue,
-                        Err(_) => {
-                            // TODO ??
-                            tracing::error!("can't enqueue message ");
-                            return;
+    loop {
+        tokio::select! {
+                client_msg = receiver.next() => {
+                    if let Some(Ok(msg)) = client_msg {
+                        // Process ws message
+                        match process_ws_message(msg, peer_addr) {
+                            ControlFlow::Continue(Some(msg)) => {
+                                // Enqueue to redis
+                                tracing::info!("Enqueueing {} msg for {}.", msg.count, &peer_addr);
+                                for idx in 0..msg.count {
+                                    let worker_msg = format!("{}:{}:{}", client_id, msg.mid, idx);
+                                    match redis::cmd("LPUSH")
+                                        .arg("queue")
+                                        .arg(worker_msg)
+                                        .query_async::<_, usize>(&mut conn)
+                                        .await
+                                    {
+                                        Ok(_) => continue,
+                                        Err(_) => {
+                                            // TODO ??
+                                            tracing::error!("can't enqueue message ");
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            ControlFlow::Continue(None) => continue,
+                            // TODO: maybe flush before sending
+                            ControlFlow::Break(_) => {
+                                tracing::info!("Websocket context {peer_addr} destroyed");
+                            return
                         }
                     }
+                    }
                 }
-            }
-            ControlFlow::Continue(None) => continue,
-            ControlFlow::Break(_) => return,
+                worker_msg = rx.recv_async() => {
+                    // Send response to the client
+                  if let Ok(worker_msg) = worker_msg {
+
+                  tracing::debug!(worker_msg = ?worker_msg ,"Sent worker message to client : {} ",&client_id);
+                  if sender
+                        .send(Message::Binary(serde_json::to_vec(&worker_msg).unwrap()))
+                        .await
+                        .is_err()
+                    {
+                        tracing::error!("can't send processed message to client");
+                        return;
+                    }
+
+                  }else{
+                    tracing::error!("send channel closed")
+                  }
+
+
+                }
+
         }
     }
-
-    // returning from the handler closes the websocket connection
-    tracing::info!("Websocket context {peer_addr} destroyed");
 }
 
-/// helper to print contents of messages to stdout. Has special treatment for Close.
 fn process_ws_message(msg: Message, peer: SocketAddr) -> ControlFlow<(), Option<ClientMessage>> {
     match msg {
         Message::Binary(data) => {
@@ -111,13 +139,20 @@ fn process_ws_message(msg: Message, peer: SocketAddr) -> ControlFlow<(), Option<
     }
 }
 
-async fn handle_worker(Json(msg): Json<WorkerMessage>, State(state): State<Appstate>) {
+async fn handle_worker(
+    State(state): State<Appstate>,
+    Json(msg): Json<WorkerMessage>,
+) -> StatusCode {
     let map = state.socket_to_tx.lock().await;
-    match map.get() {
-        Some(_) => {}
-        None => {
-            todo!("retrun http error")
+    tracing::info!(msg = ?msg,"received processed_msg from worker");
+
+    match map.get(&msg.cid) {
+        Some(tx) => {
+            //todo: deal with channel closed
+            tx.send_async(msg).await.expect("can't send worker message");
+            StatusCode::ACCEPTED
         }
+        None => StatusCode::NOT_FOUND,
     }
 }
 

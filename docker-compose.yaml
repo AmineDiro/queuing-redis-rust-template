@@ -4,10 +4,4 @@ services:
     restart: always
     ports:
       - '6379:6379'
-    command: redis-server --save 20 1 --loglevel debug
-    networks:
-      - redis
-
-networks:
-  redis:
-    driver: bridge
+    command: redis-server --save 21 1 --loglevel debug

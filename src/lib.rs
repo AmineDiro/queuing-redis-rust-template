@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -22,7 +23,8 @@ pub struct ClientMessage {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct WorkerMessage {
-    command: CommandType,
-    result_idx: usize,
-    mid: usize,
+    pub command: CommandType,
+    pub result_idx: usize,
+    pub mid: usize,
+    pub cid: Uuid,
 }
