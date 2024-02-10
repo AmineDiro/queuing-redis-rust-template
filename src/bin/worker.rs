@@ -4,11 +4,6 @@ use rand::{self, rngs::ThreadRng, Rng};
 use redis::{Client, Commands, ErrorKind, FromRedisValue, RedisResult};
 use uuid::Uuid;
 
-struct Message {
-    _id: Uuid,
-    _data: Vec<u8>,
-}
-
 impl FromRedisValue for Message {
     fn from_redis_value(v: &redis::Value) -> redis::RedisResult<Self> {
         match v {
@@ -25,7 +20,7 @@ impl FromRedisValue for Message {
 
 fn process_task<'a>(rng: &mut ThreadRng, msg: &'a str) -> anyhow::Result<()> {
     tracing::info!("Received msg : {}", msg);
-    let work_time = rng.gen_range(300..500);
+    let work_time = rng.gen_range(30..50);
     sleep(Duration::from_millis(work_time));
     Ok(())
     // Send POST request to the backend

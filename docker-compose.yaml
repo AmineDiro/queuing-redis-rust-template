@@ -5,3 +5,9 @@ services:
     ports:
       - '6379:6379'
     command: redis-server --save 20 1 --loglevel debug
+    networks:
+      - redis
+
+networks:
+  redis:
+    driver: bridge

@@ -4,13 +4,14 @@ use axum::{
         State,
     },
     response::IntoResponse,
-    routing::get,
-    Router,
+    routing::{get, post},
+    Json, Router,
 };
-use redis::{aio::ConnectionManager, AsyncCommands, Client};
-use serde::{Deserialize, Serialize};
-
-use std::{net::SocketAddr, ops::ControlFlow, sync::Arc};
+use flume::Receiver;
+use redis::{aio::ConnectionManager, Client};
+use redis_queue::{ClientMessage, WorkerMessage};
+use std::{collections::HashMap, net::SocketAddr, ops::ControlFlow, sync::Arc};
+use tokio::sync::Mutex;
 use tracing;
 use tracing_subscriber;
 use uuid::Uuid;
@@ -20,83 +21,68 @@ use tower_http::{
     trace::{DefaultMakeSpan, TraceLayer},
 };
 
-//allows to extract the IP of connecting user
 use axum::extract::connect_info::ConnectInfo;
 use futures::stream::StreamExt;
 
 async fn ws_handler(
     ws: WebSocketUpgrade,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(conn): State<ConnectionManager>,
+    State(state): State<Appstate>,
 ) -> impl IntoResponse {
     tracing::info!("{addr} connected.");
     // finalize the upgrade process by returning upgrade callback.
     let client_id = Uuid::new_v4();
-    ws.on_upgrade(move |socket| handle_socket(socket, addr, client_id, conn))
-}
 
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "lowercase")]
-enum CommandType {
-    Enqueue,
-    Processed,
-}
-#[derive(Serialize, Deserialize, Debug)]
-struct ClientMessage {
-    command: CommandType,
-    count: usize,
-    mid: usize,
+    let mut hashmap = state.socket_to_tx.lock().await;
+    let (tx, rx) = flume::unbounded();
+    hashmap.insert(client_id, tx);
+    ws.on_upgrade(move |socket| handle_socket(socket, addr, client_id, state.conn, rx))
 }
 
 // Websocket statemachine (one will be spawned per connection)
 async fn handle_socket(
-    mut socket: WebSocket,
+    socket: WebSocket,
     peer_addr: SocketAddr,
     client_id: Uuid,
     mut conn: ConnectionManager,
+    rx: Receiver<WorkerMessage>,
 ) {
-    let (mut sender, mut receiver) = socket.split();
+    let (mut _sender, mut receiver) = socket.split();
 
-    // This second task will receive messages from client and print them on server console
-    let mut recv_task = tokio::spawn(async move {
-        while let Some(Ok(msg)) = receiver.next().await {
-            // Process ws message
-            match process_message(msg, peer_addr) {
-                ControlFlow::Continue(Some(msg)) => {
-                    // Enqueue to redis
-                    tracing::info!("Enqueueing {} msg for {}.", msg.count, &peer_addr);
-                    for idx in 0..msg.count {
-                        let worker_msg = format!("{}:{}:{}", client_id, msg.mid, idx);
-                        let _: usize = redis::cmd("LPUSH")
-                            .arg("queue")
-                            .arg(worker_msg)
-                            .query_async(&mut conn)
-                            .await
-                            .unwrap();
+    while let Some(Ok(msg)) = receiver.next().await {
+        // Process ws message
+        match process_ws_message(msg, peer_addr) {
+            ControlFlow::Continue(Some(msg)) => {
+                // Enqueue to redis
+                tracing::info!("Enqueueing {} msg for {}.", msg.count, &peer_addr);
+                for idx in 0..msg.count {
+                    let worker_msg = format!("{}:{}:{}", client_id, msg.mid, idx);
+                    match redis::cmd("LPUSH")
+                        .arg("queue")
+                        .arg(worker_msg)
+                        .query_async::<_, usize>(&mut conn)
+                        .await
+                    {
+                        Ok(_) => continue,
+                        Err(_) => {
+                            // TODO ??
+                            tracing::error!("can't enqueue message ");
+                            return;
+                        }
                     }
                 }
-                ControlFlow::Continue(None) => continue,
-                ControlFlow::Break(_) => return,
             }
+            ControlFlow::Continue(None) => continue,
+            ControlFlow::Break(_) => return,
         }
-    });
-
-    // If any one of the tasks exit, abort the other.
-    // tokio::select! {
-    //     rv_a = (&mut send_task) => {
-    //         recv_task.abort();
-    //     },
-    //     rv_b = (&mut recv_task) => {
-    //         send_task.abort();
-    //     }
-    // }
+    }
 
     // returning from the handler closes the websocket connection
     tracing::info!("Websocket context {peer_addr} destroyed");
 }
 
 /// helper to print contents of messages to stdout. Has special treatment for Close.
-fn process_message(msg: Message, peer: SocketAddr) -> ControlFlow<(), Option<ClientMessage>> {
+fn process_ws_message(msg: Message, peer: SocketAddr) -> ControlFlow<(), Option<ClientMessage>> {
     match msg {
         Message::Binary(data) => {
             // serde json to deserialize
@@ -107,12 +93,14 @@ fn process_message(msg: Message, peer: SocketAddr) -> ControlFlow<(), Option<Cli
         }
         Message::Close(c) => {
             if let Some(cf) = c {
-                println!(
+                tracing::info!(
                     ">>> {} sent close with code {} and reason `{}`",
-                    peer, cf.code, cf.reason
+                    peer,
+                    cf.code,
+                    cf.reason
                 );
             } else {
-                println!(">>> {peer} somehow sent close message without CloseFrame");
+                tracing::error!(">>> {peer} somehow sent close message without CloseFrame");
             }
             return ControlFlow::Break(());
         }
@@ -123,16 +111,37 @@ fn process_message(msg: Message, peer: SocketAddr) -> ControlFlow<(), Option<Cli
     }
 }
 
+async fn handle_worker(Json(msg): Json<WorkerMessage>, State(state): State<Appstate>) {
+    let map = state.socket_to_tx.lock().await;
+    match map.get() {
+        Some(_) => {}
+        None => {
+            todo!("retrun http error")
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Appstate {
+    conn: ConnectionManager,
+    socket_to_tx: Arc<Mutex<HashMap<Uuid, flume::Sender<WorkerMessage>>>>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let client = Client::open("redis://localhost:6379")?;
-    let mut con = ConnectionManager::new(client).await?;
+    let conn = ConnectionManager::new(client).await?;
+    let state = Appstate {
+        conn,
+        socket_to_tx: Arc::new(Mutex::new(HashMap::new())),
+    };
 
     let app = Router::new()
-        .route("/ws", get(ws_handler))
-        .with_state(con)
+        .route("/processed", post(handle_worker))
+        .route("/enqueue", get(ws_handler))
+        .with_state(state)
         .fallback_service(ServeDir::new("assets/").append_index_html_on_directories(true))
         .layer(
             TraceLayer::new_for_http()

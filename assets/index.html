@@ -13,7 +13,7 @@
     <div id="output"></div>
 
     <script>
-      const socket = new WebSocket("ws://localhost:3000/ws");
+      const socket = new WebSocket("ws://localhost:3000/enqueue");
 
       var msg_id = 0;
       socket.onopen = function (event) {
