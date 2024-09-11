@@ -1,20 +1,17 @@
 use axum::{
-    extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
-    },
-    http::StatusCode,
+    extract::{ws::WebSocketUpgrade, State},
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
+    Router,
 };
-use flume::Receiver;
+use axum_tracing_opentelemetry::middleware::OtelAxumLayer;
+
+use opentelemetry::global;
 use redis::{aio::ConnectionManager, Client};
-use redis_queue::{ClientMessage, WorkerMessage};
-use std::{collections::HashMap, net::SocketAddr, ops::ControlFlow, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::sync::Mutex;
-use tracing;
-use tracing_subscriber;
+use tracing::{self, instrument, Level};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use uuid::Uuid;
 
 use tower_http::{
@@ -23,148 +20,50 @@ use tower_http::{
 };
 
 use axum::extract::connect_info::ConnectInfo;
-use futures::{stream::StreamExt, SinkExt};
+
+use redis_queue::{
+    handlers::{handle_socket, handle_worker},
+    Appstate,
+};
 
 async fn ws_handler(
     ws: WebSocketUpgrade,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Appstate>,
 ) -> impl IntoResponse {
-    tracing::info!("{addr} connected.");
     // finalize the upgrade process by returning upgrade callback.
     let client_id = Uuid::new_v4();
-
     let mut hashmap = state.socket_to_tx.lock().await;
     let (tx, rx) = flume::unbounded();
+    let span = tracing::span!(Level::TRACE, "ws_handler");
+    tracing::trace!(client_id = &client_id.to_string(), "{addr} connected. ");
+    let _enter = span.enter();
     hashmap.insert(client_id, tx);
-    ws.on_upgrade(move |socket| handle_socket(socket, addr, client_id, state.conn, rx))
-}
-
-// Websocket statemachine (one will be spawned per connection)
-async fn handle_socket(
-    socket: WebSocket,
-    peer_addr: SocketAddr,
-    client_id: Uuid,
-    mut conn: ConnectionManager,
-    rx: Receiver<WorkerMessage>,
-) {
-    let (mut sender, mut receiver) = socket.split();
-
-    loop {
-        tokio::select! {
-                client_msg = receiver.next() => {
-                    if let Some(Ok(msg)) = client_msg {
-                        // Process ws message
-                        match process_ws_message(msg, peer_addr) {
-                            ControlFlow::Continue(Some(msg)) => {
-                                // Enqueue to redis
-                                tracing::info!("Enqueueing {} msg for {}.", msg.count, &peer_addr);
-                                for idx in 0..msg.count {
-                                    let worker_msg = format!("{}:{}:{}", client_id, msg.mid, idx);
-                                    match redis::cmd("LPUSH")
-                                        .arg("queue")
-                                        .arg(worker_msg)
-                                        .query_async::<_, usize>(&mut conn)
-                                        .await
-                                    {
-                                        Ok(_) => continue,
-                                        Err(_) => {
-                                            // TODO ??
-                                            tracing::error!("can't enqueue message ");
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-                            ControlFlow::Continue(None) => continue,
-                            // TODO: maybe flush before sending
-                            ControlFlow::Break(_) => {
-                                tracing::info!("Websocket context {peer_addr} destroyed");
-                            return
-                        }
-                    }
-                    }
-                }
-                worker_msg = rx.recv_async() => {
-                    // Send response to the client
-                  if let Ok(worker_msg) = worker_msg {
-
-                  tracing::debug!(worker_msg = ?worker_msg ,"Sent worker message to client : {} ",&client_id);
-                  if sender
-                        .send(Message::Binary(serde_json::to_vec(&worker_msg).unwrap()))
-                        .await
-                        .is_err()
-                    {
-                        tracing::error!("can't send processed message to client");
-                        return;
-                    }
-
-                  }else{
-                    tracing::error!("send channel closed")
-                  }
-
-
-                }
-
-        }
-    }
-}
-
-fn process_ws_message(msg: Message, peer: SocketAddr) -> ControlFlow<(), Option<ClientMessage>> {
-    match msg {
-        Message::Binary(data) => {
-            // serde json to deserialize
-            let client_msg: ClientMessage =
-                serde_json::from_slice(&data).expect("can't deserialize data");
-            tracing::info!("Received  binary: {:?}", client_msg);
-            return ControlFlow::Continue(Some(client_msg));
-        }
-        Message::Close(c) => {
-            if let Some(cf) = c {
-                tracing::info!(
-                    ">>> {} sent close with code {} and reason `{}`",
-                    peer,
-                    cf.code,
-                    cf.reason
-                );
-            } else {
-                tracing::error!(">>> {peer} somehow sent close message without CloseFrame");
-            }
-            return ControlFlow::Break(());
-        }
-        _ => {
-            tracing::info!("Client send an unhandled message type");
-            return ControlFlow::Continue(None);
-        }
-    }
-}
-
-async fn handle_worker(
-    State(state): State<Appstate>,
-    Json(msg): Json<WorkerMessage>,
-) -> StatusCode {
-    let map = state.socket_to_tx.lock().await;
-    tracing::info!(msg = ?msg,"received processed_msg from worker");
-
-    match map.get(&msg.cid) {
-        Some(tx) => {
-            //todo: deal with channel closed
-            tx.send_async(msg).await.expect("can't send worker message");
-            StatusCode::ACCEPTED
-        }
-        None => StatusCode::NOT_FOUND,
-    }
-}
-
-#[derive(Clone)]
-struct Appstate {
-    conn: ConnectionManager,
-    socket_to_tx: Arc<Mutex<HashMap<Uuid, flume::Sender<WorkerMessage>>>>,
+    let span = span.clone();
+    ws.on_upgrade(move |socket| handle_socket(span, socket, addr, client_id, state.conn, rx))
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    global::set_text_map_propagator(opentelemetry_zipkin::Propagator::new());
+    let fmt_subscriber = tracing_subscriber::fmt::layer();
+    let tracer = opentelemetry_zipkin::new_pipeline()
+        .with_service_name("redis-server")
+        .with_service_address("127.0.0.1:3000".parse().unwrap())
+        .with_collector_endpoint("http://localhost:9411/api/v2/spans")
+        .install_batch(opentelemetry::runtime::Tokio)
+        .expect("unable to install zipkin tracer");
+    let tracer = tracing_opentelemetry::layer().with_tracer(tracer);
+
+    let registry = tracing_subscriber::registry()
+        .with(fmt_subscriber)
+        .with(tracer)
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "server=trace,redis_queue=trace,tower_http=error".into()),
+        );
+
+    registry.init();
 
     let client = Client::open("redis://localhost:6379")?;
     let conn = ConnectionManager::new(client).await?;
@@ -181,7 +80,8 @@ async fn main() -> anyhow::Result<()> {
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::default().include_headers(true)),
-        );
+        )
+        .layer(OtelAxumLayer::default());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
         .await
@@ -193,5 +93,6 @@ async fn main() -> anyhow::Result<()> {
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await?;
+    global::shutdown_tracer_provider();
     Ok(())
 }
