@@ -1,4 +1,7 @@
+use opentelemetry::propagation::TextMapPropagator;
+use opentelemetry::sdk::propagation::TraceContextPropagator;
 use std::{str::FromStr, thread::sleep, time::Duration};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use opentelemetry::global;
 use rand::{self, rngs::ThreadRng, Rng};
@@ -12,21 +15,20 @@ use uuid::Uuid;
 fn process_task<'a>(
     rng: &mut ThreadRng,
     client: &reqwest::blocking::Client,
-    msg: &'a str,
+    cid: Uuid,
+    mid: usize,
+    idx: usize,
 ) -> anyhow::Result<()> {
-    tracing::debug!("Received msg : {:?}", &msg);
     let work_time = rng.gen_range(1..10);
     sleep(Duration::from_millis(work_time));
-    // Send POST request to the backen'
-    let parts: Vec<String> = msg.splitn(3, ':').map(|e| e.to_string()).collect();
-
+    // Send POST request to the backend
     let msg = WorkerMessage {
         command: CommandType::Processed,
-        result_idx: parts[2].parse::<usize>()?,
-        mid: parts[1].parse::<usize>()?,
-        cid: Uuid::from_str(&parts[0])?,
+        cid,
+        mid,
+        result_idx: idx,
     };
-    tracing::debug!(msg = ?msg, "Sending worker message to client.");
+    tracing::info!(msg = ?msg, "Sending worker message to client.");
     client
         .post("http://localhost:3000/processed")
         .json(&msg)
@@ -61,9 +63,23 @@ fn main() -> Result<(), anyhow::Error> {
     loop {
         let msg: Vec<String> = con.brpop("queue", 0.5)?;
         if msg.len() >= 1 {
-            process_task(&mut rng, &http_client, &msg[1])?;
+            // TODO: Move to func
+            let parts: Vec<String> = msg[1].splitn(4, ':').map(|e| e.to_string()).collect();
+            let client_id = Uuid::from_str(&parts[0]).unwrap();
+            let mid = &parts[1].parse::<usize>().unwrap();
+            let idx = &parts[2].parse::<usize>().unwrap();
+            let span_context_json = &parts[3];
+
+            let span_context_map: std::collections::HashMap<String, String> =
+                serde_json::from_str(span_context_json).unwrap();
+            let propagator = TraceContextPropagator::new();
+            let parent_context = propagator.extract(&span_context_map);
+            let span =
+                tracing::span!(tracing::Level::INFO, "process_task",client_id=?client_id, mid, idx);
+            span.set_parent(parent_context);
+
+            let _guard = span.enter();
+            process_task(&mut rng, &http_client, client_id, *mid, *idx)?;
         }
     }
-
-    global::shutdown_tracer_provider();
 }

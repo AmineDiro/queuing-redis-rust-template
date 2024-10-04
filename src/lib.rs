@@ -25,13 +25,7 @@ pub struct ClientMessage {
     pub count: usize,
     pub mid: usize,
 }
-// {
-// "command": "processed",
-// "result": {
-// "idx": idx
-// },
-// "mid": messageId
-// }
+// { "command": "enqueue", "count": 100, "mid": 12 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct WorkerMessage {
