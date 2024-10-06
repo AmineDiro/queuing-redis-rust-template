@@ -2,19 +2,20 @@ use crate::{Appstate, ClientMessage, WorkerMessage};
 use axum::{
     extract::{
         ws::{Message, WebSocket},
-        State,
+        ConnectInfo, State, WebSocketUpgrade,
     },
     http::StatusCode,
+    response::IntoResponse,
     Json,
 };
 use flume::Receiver;
 use futures::{stream::StreamExt, SinkExt};
-use opentelemetry::propagation::TextMapPropagator;
-use opentelemetry::sdk::propagation::TraceContextPropagator;
+use opentelemetry::{global, propagation::TextMapPropagator};
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use redis::aio::ConnectionManager;
 use std::{net::SocketAddr, ops::ControlFlow};
-use tracing::Span;
-use tracing::{self, instrument};
+use tracing::{self, info_span, instrument};
+use tracing::{Instrument, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
@@ -28,9 +29,36 @@ fn get_span_context() -> String {
     serde_json::to_string(&span_context).unwrap()
 }
 
+pub async fn healthz() -> &'static str {
+    "Ok"
+}
+
+#[instrument(skip(state, ws))]
+pub async fn ws_handler(
+    ws: WebSocketUpgrade,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<Appstate>,
+) -> impl IntoResponse {
+    // finalize the upgrade process by returning upgrade callback.
+    let client_id = Uuid::new_v4();
+    let mut hashmap = state.socket_to_tx.lock().await;
+    let (tx, rx) = flume::unbounded();
+    hashmap.insert(client_id, tx);
+    // info_span!("ws_handler", client_id = &client_id.to_string(),);
+    // ws.on_upgrade(move |socket| handle_socket(socket, addr, client_id, state.conn, rx))
+    let span = tracing::Span::current();
+    ws.on_upgrade(move |socket| {
+        let span = span.clone();
+        async move {
+            handle_socket(socket, addr, client_id, state.conn, rx)
+                .instrument(span)
+                .await;
+        }
+    })
+}
 // Websocket statemachine (one will be spawned per connection)
 #[instrument(skip(socket, conn, rx))]
-pub async fn handle_socket(
+async fn handle_socket(
     socket: WebSocket,
     peer_addr: SocketAddr,
     client_id: Uuid,
@@ -45,34 +73,39 @@ pub async fn handle_socket(
                     if let Some(Ok(msg)) = client_msg {
                         // Process ws message
                         tracing::info!("received msg: {:?}", msg);
-                        // match process_ws_message(msg, peer_addr,client_id) {
-                        //     ControlFlow::Continue(Some(msg)) => {
-                        //         // Enqueue to redis
-                        //         tracing::info!("enqueueing {} msg for {}.", msg.count, &peer_addr);
-                        //         for idx in 0..msg.count {
-                        //             let worker_msg = format!("{}:{}:{}:{}", client_id, msg.mid, idx, &span_context);
-                        //             match redis::cmd("LPUSH")
-                        //                 .arg("queue")
-                        //                 .arg(worker_msg)
-                        //                 .query_async::<_, usize>(&mut conn)
-                        //                 .await
-                        //             {
-                        //                 Ok(_) => continue,
-                        //                 Err(_) => {
-                        //                     // TODO
-                        //                     tracing::error!("can't enqueue message");
-                        //                     return;
-                        //                 }
-                        //             }
-                        //         }
-                        //     }
-                        //     ControlFlow::Continue(None) => continue,
-                        //     // TODO: maybe flush before sending
-                        //     ControlFlow::Break(_) => {
-                        //         tracing::info!("websocket context {peer_addr} destroyed");
-                        //     return
-                        // }
-                    // }
+                        match process_ws_message(msg, peer_addr,client_id) {
+                            ControlFlow::Continue(Some(msg)) => {
+                                // Enqueue to redis
+                                tracing::info!("enqueueing {} msg for {}.", msg.count, &peer_addr);
+                                for idx in 0..msg.count {
+                                    let worker_msg = format!("{}:{}:{}:{}", client_id, msg.mid, idx, &span_context);
+                                    match redis::cmd("LPUSH")
+                                        .arg("queue")
+                                        .arg(worker_msg)
+                                        .query_async::<_, usize>(&mut conn)
+                                        .await
+                                    {
+                                        Ok(_) => continue,
+                                        Err(_) => {
+                                            // TODO
+                                            tracing::error!("can't enqueue message");
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            ControlFlow::Continue(None) => continue,
+                            // TODO: maybe flush before sending
+                            ControlFlow::Break(_) => {
+                                tracing::info!("websocket context {peer_addr} destroyed");
+                            return
+                        }
+                    }
+                    }
+                    else{
+                        tracing::info!("Closing websocket connection");
+                        // global::tracer_provider().force_flush();
+                        return
                     }
                 }
                 worker_msg = rx.recv_async() => {
@@ -101,7 +134,7 @@ pub async fn handle_socket(
     }
 }
 
-pub fn process_ws_message(
+fn process_ws_message(
     msg: Message,
     peer: SocketAddr,
     client_id: Uuid,
