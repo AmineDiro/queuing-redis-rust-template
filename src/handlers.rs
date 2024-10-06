@@ -10,11 +10,12 @@ use axum::{
 };
 use flume::Receiver;
 use futures::{stream::StreamExt, SinkExt};
-use opentelemetry::{global, propagation::TextMapPropagator};
+use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use redis::aio::ConnectionManager;
+use serde_json::json;
 use std::{net::SocketAddr, ops::ControlFlow};
-use tracing::{self, info_span, instrument};
+use tracing::{self, instrument};
 use tracing::{Instrument, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
@@ -29,8 +30,8 @@ fn get_span_context() -> String {
     serde_json::to_string(&span_context).unwrap()
 }
 
-pub async fn healthz() -> &'static str {
-    "Ok"
+pub async fn healthz() -> impl IntoResponse {
+    axum::Json(json!({ "status" : "UP" }))
 }
 
 #[instrument(skip(state, ws))]

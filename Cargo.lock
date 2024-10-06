@@ -1546,6 +1546,7 @@ dependencies = [
  "flume",
  "futures",
  "opentelemetry 0.25.0",
+ "opentelemetry-http",
  "opentelemetry-jaeger",
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions 0.26.0",
@@ -1555,6 +1556,7 @@ dependencies = [
  "rand",
  "redis",
  "reqwest 0.11.24",
+ "reqwest-middleware",
  "serde",
  "serde_json",
  "tokio",
@@ -1696,6 +1698,21 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "winreg 0.52.0",
+]
+
+[[package]]
+name = "reqwest-middleware"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "562ceb5a604d3f7c885a792d42c199fd8af239d0a51b2fa6a78aafa092452b04"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "http 1.1.0",
+ "reqwest 0.12.5",
+ "serde",
+ "thiserror",
+ "tower-service",
 ]
 
 [[package]]

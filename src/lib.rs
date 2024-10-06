@@ -27,13 +27,13 @@ pub enum CommandType {
     Enqueue,
     Processed,
 }
+/// Json example: { "command": "enqueue", "count": 20, "mid": 12 }
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ClientMessage {
     pub command: CommandType,
     pub count: usize,
     pub mid: usize,
 }
-// { "command": "enqueue", "count": 100, "mid": 12 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct WorkerMessage {
