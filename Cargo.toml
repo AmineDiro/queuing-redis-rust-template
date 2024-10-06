@@ -31,3 +31,4 @@ opentelemetry-zipkin = { version = "0.18.0", features = [
     "reqwest-blocking-client",
 ], default-features = false }
 axum-tracing-opentelemetry = "0.17.0"
+opentelemetry-jaeger = { version = "0.19", features = ["rt-tokio"] }

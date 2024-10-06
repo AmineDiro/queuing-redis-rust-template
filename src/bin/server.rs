@@ -1,26 +1,27 @@
 use axum::{
-    extract::{ws::WebSocketUpgrade, MatchedPath, Request, State},
+    extract::{ws::WebSocketUpgrade, State},
     response::IntoResponse,
     routing::{get, post},
     Router,
 };
 use axum_tracing_opentelemetry::middleware::OtelAxumLayer;
-use tracing::{info_span, instrument, Instrument};
+use tower_http::trace::{DefaultMakeSpan, TraceLayer};
+use tracing::{instrument, Instrument};
 
 use opentelemetry::global;
 use redis::{aio::ConnectionManager, Client};
-use std::{collections::HashMap, future::IntoFuture, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::sync::Mutex;
 use tracing::{self, Level};
-use tracing_subscriber::{
-    fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
-};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use uuid::Uuid;
 
-use tower_http::{services::ServeDir, trace::TraceLayer};
+use tower_http::services::ServeDir;
 
 use axum::extract::connect_info::ConnectInfo;
 
+use opentelemetry::runtime::Tokio;
+use opentelemetry::sdk::propagation::TraceContextPropagator;
 use redis_queue::{
     handlers::{handle_socket, handle_worker},
     Appstate,
@@ -53,27 +54,26 @@ async fn ws_handler(
         }
     })
 }
+fn init_tracing() {
+    axum_tracing_opentelemetry::tracing_subscriber_ext::init_subscribers()?;
+
+    // Create a Jaeger pipeline
+    let tracer = opentelemetry_jaeger::new_agent_pipeline()
+        .with_service_name("redis-server")
+        .install_batch(Tokio)
+        .expect("Error initializing Jaeger exporter");
+
+    // Initialize tracing subscriber
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_opentelemetry::layer().with_tracer(tracer))
+        .init();
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    global::set_text_map_propagator(opentelemetry_zipkin::Propagator::new());
-    let fmt_subscriber = tracing_subscriber::fmt::layer().with_span_events(FmtSpan::FULL);
-    let tracer = opentelemetry_zipkin::new_pipeline()
-        .with_service_name("redis-server")
-        .with_service_address("127.0.0.1:3000".parse().unwrap())
-        .with_collector_endpoint("http://localhost:9411/api/v2/spans")
-        .install_batch(opentelemetry::runtime::Tokio)
-        .expect("unable to install zipkin tracer");
-    let tracer = tracing_opentelemetry::layer().with_tracer(tracer);
-
-    tracing_subscriber::registry()
-        .with(fmt_subscriber)
-        .with(tracer)
-        .with(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "server=debug,tower_http=debug".into()),
-        )
-        .init();
+    init_tracing();
 
     let client = Client::open("redis://localhost:6379")?;
     let conn = ConnectionManager::new(client).await?;
@@ -89,18 +89,7 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state)
         .fallback_service(ServeDir::new("assets/").append_index_html_on_directories(true))
         .layer(
-            TraceLayer::new_for_http().make_span_with(|request: &Request<_>| {
-                let matched_path = request
-                    .extensions()
-                    .get::<MatchedPath>()
-                    .map(MatchedPath::as_str);
-
-                info_span!(
-                    "request",
-                    method = ?request.method(),
-                    matched_path,
-                )
-            }),
+            TraceLayer::new_for_http().make_span_with(DefaultMakeSpan::new().include_headers(true)),
         )
         .layer(OtelAxumLayer::default());
 
