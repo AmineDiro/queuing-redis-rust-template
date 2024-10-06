@@ -43,35 +43,33 @@ async fn main() -> anyhow::Result<()> {
         .route("/healthz", get(healthz))
         .fallback_service(ServeDir::new("assets/").append_index_html_on_directories(true))
         .layer(
-            TraceLayer::new_for_http()
-                .make_span_with(|request: &Request<_>| {
-                    let matched_path = request
-                        .extensions()
-                        .get::<MatchedPath>()
-                        .map(MatchedPath::as_str);
-                    info_span!(
-                        "http_request",
-                        method = ?request.method(),
-                        matched_path,
-                        some_other_field = tracing::field::Empty,
-                    )
-                })
-                .on_response(
-                    |_response: &Response<_>, _latency: Duration, _span: &Span| {
-                        let propagator = TraceContextPropagator::new();
-                        let mut span_context = std::collections::HashMap::new();
-                        // Extract the current span context
-                        let span = Span::current();
-                        let context = span.context();
+            TraceLayer::new_for_http().make_span_with(|request: &Request<_>| {
+                let matched_path = request
+                    .extensions()
+                    .get::<MatchedPath>()
+                    .map(MatchedPath::as_str);
+                info_span!(
+                    "http_request",
+                    method = ?request.method(),
+                    matched_path,
+                    some_other_field = tracing::field::Empty,
+                )
+            }), // .on_response(
+                //     |_response: &Response<_>, _latency: Duration, _span: &Span| {
+                //         let propagator = TraceContextPropagator::new();
+                //         let mut span_context = std::collections::HashMap::new();
+                //         // Extract the current span context
+                //         let span = Span::current();
+                //         let context = span.context();
 
-                        global::get_text_map_propagator(|propagator| {
-                            propagator.inject_context(
-                                &cx,
-                                &mut HeaderInjector(req.headers_mut().unwrap()),
-                            )
-                        });
-                    },
-                ),
+                //         global::get_text_map_propagator(|propagator| {
+                //             propagator.inject_context(
+                //                 &cx,
+                //                 &mut HeaderInjector(req.headers_mut().unwrap()),
+                //             )
+                //         });
+                //     },
+                // ),
         )
         .layer(OtelInResponseLayer::default())
         .layer(OtelAxumLayer::default());
